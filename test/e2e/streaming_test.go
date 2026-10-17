@@ -107,10 +107,11 @@ func streamingTestServer(t *testing.T, script streamScript) *httptest.Server {
 	})
 }
 
-func dialStreamingGateway(t *testing.T, ts *httptest.Server, smallReadBuffer bool) *websocket.Conn {
+func dialStreamingGateway(t *testing.T, ts *httptest.Server, smallReadBuffer bool) (*websocket.Conn, *net.TCPConn) {
 	t.Helper()
 
 	dialer := websocketDialer()
+	var tcpConn *net.TCPConn
 	if smallReadBuffer {
 		netDialer := &net.Dialer{Timeout: 5 * time.Second}
 		dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -118,7 +119,8 @@ func dialStreamingGateway(t *testing.T, ts *httptest.Server, smallReadBuffer boo
 			if err != nil {
 				return nil, err
 			}
-			if tcpConn, ok := conn.(*net.TCPConn); ok {
+			if rawTCPConn, ok := conn.(*net.TCPConn); ok {
+				tcpConn = rawTCPConn
 				_ = tcpConn.SetReadBuffer(1024)
 			}
 			return conn, nil
@@ -131,8 +133,11 @@ func dialStreamingGateway(t *testing.T, ts *httptest.Server, smallReadBuffer boo
 		t.Cleanup(func() { _ = resp.Body.Close() })
 	}
 	require.NoError(t, err, "dialing gateway WebSocket")
+	if smallReadBuffer {
+		require.NotNil(t, tcpConn, "gateway WebSocket must use TCP")
+	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return conn
+	return conn, tcpConn
 }
 
 func sendExecutionFrame(t *testing.T, conn *websocket.Conn, code string) {
@@ -166,7 +171,7 @@ func TestE2E_StreamingMessageTypes(t *testing.T) {
 			}
 			return writeBackendFrame(conn, streaming.FrameResult, map[string]any{"exitCode": 7, "duration": 0.25})
 		})
-		conn := dialStreamingGateway(t, ts, false)
+		conn, _ := dialStreamingGateway(t, ts, false)
 
 		require.NoError(t, conn.WriteJSON(map[string]any{"type": streaming.FrameKeepAlive}))
 		keepAlive := readStreamFrame(t, conn)
@@ -206,7 +211,7 @@ func TestE2E_StreamingMessageTypes(t *testing.T) {
 				"code": "execution_failed", "message": "backend rejected execution",
 			})
 		})
-		conn := dialStreamingGateway(t, ts, false)
+		conn, _ := dialStreamingGateway(t, ts, false)
 
 		sendExecutionFrame(t, conn, "error")
 		frame := readStreamFrame(t, conn)
@@ -231,7 +236,7 @@ func TestE2E_StreamingCancelStopsDelivery(t *testing.T) {
 		}
 		return writeBackendFrame(conn, streaming.FrameResult, map[string]any{"exitCode": 0})
 	})
-	conn := dialStreamingGateway(t, ts, false)
+	conn, _ := dialStreamingGateway(t, ts, false)
 
 	sendExecutionFrame(t, conn, "cancel")
 	first := readStreamFrame(t, conn)
@@ -271,7 +276,7 @@ func TestE2E_StreamingBackpressure(t *testing.T) {
 		}
 		return writeBackendFrame(conn, streaming.FrameResult, map[string]any{"exitCode": 0})
 	})
-	conn := dialStreamingGateway(t, ts, true)
+	conn, tcpConn := dialStreamingGateway(t, ts, true)
 
 	sendExecutionFrame(t, conn, "backpressure")
 	select {
@@ -289,6 +294,12 @@ func TestE2E_StreamingBackpressure(t *testing.T) {
 		t.Fatal("backend completed the 16 MiB burst while the client was not reading")
 	default:
 	}
+
+	// Restore a normal receive window before draining. Keeping the deliberately
+	// tiny window would make the transfer depend on TCP window-update timing and
+	// can take minutes under the race detector even after the client starts
+	// reading.
+	require.NoError(t, tcpConn.SetReadBuffer(4*1024*1024))
 
 	for i := range frameCount {
 		frame := readStreamFrame(t, conn)
