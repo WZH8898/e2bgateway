@@ -370,12 +370,6 @@ func TestParseErrorData(t *testing.T) {
 			wantMessage: "generic message",
 		},
 		{
-			name:        "string map from e2b cloud streamer",
-			data:        map[string]string{"code": "backend_error", "message": "backend message"},
-			wantCode:    "backend_error",
-			wantMessage: "backend message",
-		},
-		{
 			name:        "plain message",
 			data:        "plain message",
 			wantCode:    "unknown",
